@@ -7,6 +7,7 @@ import torchvision
 from torchvision import transforms
 from d2l import torch as d2l
 from IPython import display
+import time
 
 
 
@@ -210,3 +211,98 @@ def load_data_fashion_mnist(batch_size, resize=None):
             data.DataLoader(mnist_test, batch_size, shuffle=False,
                             num_workers=get_dataloader_workers()))
 
+def try_gpu(i=0):
+    """如果存在，则返回gpu(i)，否则返回cpu()
+
+    Defined in :numref:`sec_use_gpu`"""
+    if torch.cuda.device_count() >= i + 1:
+        return torch.device(f'cuda:{i}')
+    return torch.device('cpu')
+
+
+def time_s2dhms(s):
+    """时间秒转日时分秒"""
+    s = int(s)
+    m, s = divmod(s, 60)
+    h, m = divmod(m, 60)
+    d, h = divmod(h, 24)
+    return f'{d}:{h:02d}:{m:02d}:{s:02d}'
+
+def evaluate_accuracy_gpu(net, data_iter, device=None):
+    """使用GPU计算模型在数据集上的精度"""
+    if isinstance(net, nn.Module):
+        net.eval()  # 设置为评估模式
+        if not device:
+            device = next(net.parameters()).device
+    # 正确预测的数量，总预测的数量
+    y_hat_true_count = 0
+    y_hat_num_count = 0
+    with torch.no_grad():
+        for X, y in data_iter:
+            if isinstance(X, list):
+                # BERT微调所需的（之后将介绍）
+                X = [x.to(device) for x in X]
+            else:
+                X = X.to(device)
+            y = y.to(device)
+            
+            y_hat_true_count += accuracy(net(X), y)
+            y_hat_num_count += y.numel()
+    return y_hat_true_count / y_hat_num_count
+
+
+def train_ch6(net, train_iter, test_iter, num_epochs, lr, device):
+    """用GPU训练模型(在第六章定义)"""
+    time_0 = time.time()
+    def init_weights(m):
+        if type(m) == nn.Linear or type(m) == nn.Conv2d:
+            nn.init.xavier_uniform_(m.weight)
+    net.apply(init_weights)
+    print(f'training on: [{device}], [{time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())}]')
+    net.to(device)
+    optimizer = torch.optim.SGD(net.parameters(), lr=lr)
+    loss = nn.CrossEntropyLoss()
+    
+    # 时间用时列表
+    time_list = list()
+    # 每批次数据量
+    train_num_per_epoch = 0
+    # 初始化参数：训练集损失，训练集准确率，测试集准确率
+    train_l = train_acc = test_acc = None
+    # 训练损失之和，训练准确率之和，样本数
+    train_loss = train_hat_true_count = train_num_count = 0
+    
+    num_batches = len(train_iter)
+    for epoch in range(num_epochs):
+        # 训练损失之和，训练准确率之和，样本数
+        train_loss = 0
+        train_hat_true_count = 0
+        train_num_count = 0
+        # 训练模式
+        net.train()
+        for i, (X, y) in enumerate(train_iter):
+            start_time = time.time()
+            optimizer.zero_grad()
+            X, y = X.to(device), y.to(device)
+            y_hat = net(X)
+            l = loss(y_hat, y)
+            l.backward()
+            optimizer.step()
+            with torch.no_grad():
+                train_loss += l * X.shape[0]
+                train_hat_true_count += accuracy(y_hat, y)
+                train_num_count += X.shape[0]
+
+            time_list.append(time.time() - start_time)
+            
+            train_l = train_loss / train_num_count
+            train_acc = train_hat_true_count / train_num_count
+            
+        train_num_per_epoch = train_num_count
+        test_acc = evaluate_accuracy_gpu(net, test_iter)
+        
+        print(f'epoch: {epoch+1}/{num_epochs}, loss {train_l:.3f}, train acc {train_acc:.3f}, test acc {test_acc:.3f}')
+    
+    print(f'*** {train_num_per_epoch * num_epochs / sum(time_list):.1f} examples/sec '
+          f'on {str(device)} - [{time_s2dhms(sum(time_list))}], '
+          f'all: [{time_s2dhms(time.time() - time_0)}] ***')
