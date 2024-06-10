@@ -8,7 +8,8 @@ from torchvision import transforms
 from d2l import torch as d2l
 from IPython import display
 import time
-
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
 
 
 class Animator:
@@ -220,6 +221,14 @@ def try_gpu(i=0):
     return torch.device('cpu')
 
 
+def try_all_gpus():
+    """返回所有可用的GPU，如果没有GPU，则返回[cpu(),]
+
+    Defined in :numref:`sec_use_gpu`"""
+    devices = [torch.device(f'cuda:{i}') for i in range(torch.cuda.device_count())]
+    return devices if devices else [torch.device('cpu')]
+
+
 def time_s2dhms(s):
     """时间秒转日时分秒"""
     s = int(s)
@@ -265,8 +274,8 @@ def train_ch6(net, train_iter, test_iter, num_epochs, lr, device):
     
     # 时间用时列表
     time_list = list()
-    # 每批次数据量
-    train_num_per_epoch = 0
+    # 总训练过的数据数量
+    all_train_num_count = 0
     # 初始化参数：训练集损失，训练集准确率，测试集准确率
     train_l = train_acc = test_acc = None
     # 训练损失之和，训练准确率之和，样本数
@@ -274,7 +283,7 @@ def train_ch6(net, train_iter, test_iter, num_epochs, lr, device):
     
     num_batches = len(train_iter)
     for epoch in range(num_epochs):
-        # 训练损失之和，训练准确率之和，样本数
+        # 训练损失之和，训练准确数之和，样本数
         train_loss = 0
         train_hat_true_count = 0
         train_num_count = 0
@@ -298,11 +307,154 @@ def train_ch6(net, train_iter, test_iter, num_epochs, lr, device):
             train_l = train_loss / train_num_count
             train_acc = train_hat_true_count / train_num_count
             
-        train_num_per_epoch = train_num_count
+        all_train_num_count += train_num_count
         test_acc = evaluate_accuracy_gpu(net, test_iter)
         
-        print(f'epoch: {epoch+1}/{num_epochs}, loss {train_l:.3f}, train acc {train_acc:.3f}, test acc {test_acc:.3f}')
+        print(f'epoch: {epoch+1}/{num_epochs}, loss {train_l:.3f}, '
+              f'train acc {train_acc:.3f}, test acc {test_acc:.3f}')
     
-    print(f'*** {train_num_per_epoch * num_epochs / sum(time_list):.1f} examples/sec '
+    print(f'*** {all_train_num_count / sum(time_list):.1f} examples/sec '
           f'on {str(device)} - [{time_s2dhms(sum(time_list))}], '
           f'all: [{time_s2dhms(time.time() - time_0)}] ***')
+    
+    
+def train_gpus(net, train_iter, test_iter, loss, trainer, num_epochs,
+               devices=try_all_gpus()):
+    """用多GPU进行模型训练"""
+    time_0 = time.time()
+    # 时间用时列表
+    time_list = list()
+    # 总训练过的数据数量
+    all_train_num_count = 0
+    # 初始化参数：训练集损失，训练集准确率，测试集准确率
+    train_l = train_acc = test_acc = None
+    # 训练损失之和，训练准确率之和，样本数
+    train_loss = train_hat_true_count = train_num_count = 0
+    
+    num_batches = len(train_iter)
+    net = nn.DataParallel(net, device_ids=devices).to(devices[0])
+    for epoch in range(num_epochs):
+        # 4个维度：训练损失之和，训练准确数之和，样本数，标签特点数
+        train_loss = 0
+        train_hat_true_count = 0
+        train_num_count = 0
+        labels_num_element_count = 0
+        # 训练模式
+        net.train()
+        for i, (X, y) in enumerate(train_iter):
+            start_time = time.time()
+            
+            if isinstance(X, list):
+                # 微调BERT中所需
+                X = [x.to(devices[0]) for x in X]
+            else:
+                X = X.to(devices[0])
+            y = y.to(devices[0])
+            
+            trainer.zero_grad()
+            y_hat = net(X)
+            l = loss(y_hat, y)
+            l.sum().backward()
+            trainer.step()
+            with torch.no_grad():
+                train_loss += l.sum()
+                train_hat_true_count += accuracy(y_hat, y)
+                train_num_count += X.shape[0]
+            
+            time_list.append(time.time() - start_time)
+            
+            train_l = train_loss / train_num_count
+            train_acc = train_hat_true_count / train_num_count
+            
+        all_train_num_count += train_num_count
+        test_acc = evaluate_accuracy_gpu(net, test_iter)
+        
+        print(f'epoch: {epoch+1}/{num_epochs}, loss {train_l:.3f}, '
+              f'train acc {train_acc:.3f}, test acc {test_acc:.3f}')
+        
+    print(f'*** {all_train_num_count / sum(time_list):.1f} examples/sec '
+          f'on {str(devices)} - [{time_s2dhms(sum(time_list))}], '
+          f'all: [{time_s2dhms(time.time() - time_0)}] ***')
+
+
+    
+class Residual(nn.Module):
+    """
+        残差模块
+    """
+    def __init__(self, input_channels, num_channels,
+                 use_1x1conv=False, strides=1):
+        super().__init__()
+        self.conv1 = nn.Conv2d(
+            input_channels, num_channels, kernel_size=3, padding=1, stride=strides)
+        self.conv2 = nn.Conv2d(num_channels, num_channels, kernel_size=3, padding=1)
+        if use_1x1conv:
+            self.conv3 = nn.Conv2d(input_channels, num_channels, kernel_size=1, stride=strides)
+        else:
+            self.conv3 = lambda x: x
+        self.bn1 = nn.BatchNorm2d(num_channels)
+        self.bn2 = nn.BatchNorm2d(num_channels)
+
+    def forward(self, X):
+        """
+            主路与短路保持同样的shape
+        """
+        # 主路
+        Y = F.relu(self.bn1(self.conv1(X)))
+        Y = self.bn2(self.conv2(Y))
+        # 短路
+        X = self.conv3(X)
+        # 主路与短路复合
+        Y += X
+        return F.relu(Y)
+    
+    
+def show_images(imgs, num_rows, num_cols, titles=None, scale=1.5):
+    """
+        绘制图像列表
+    """
+    figsize = (num_cols * scale, num_rows * scale)
+    _, axes = plt.subplots(num_rows, num_cols, figsize=figsize)
+    axes = axes.flatten()
+    for i, (ax, img) in enumerate(zip(axes, imgs)):
+        if torch.is_tensor(img):
+            # 图片张量
+            ax.imshow(img.numpy())
+        else:
+            # PIL图片
+            ax.imshow(img)
+        ax.axes.get_xaxis().set_visible(False)
+        ax.axes.get_yaxis().set_visible(False)
+        if titles:
+            ax.set_title(titles[i])
+    return axes
+
+
+def resnet18(num_classes, in_channels=1):
+    """
+        稍加修改的ResNet-18模型
+    """
+    def resnet_block(in_channels, out_channels, num_residuals,
+                     first_block=False):
+        blk = []
+        for i in range(num_residuals):
+            if i == 0 and not first_block:
+                blk.append(d2l.Residual(in_channels, out_channels,
+                                        use_1x1conv=True, strides=2))
+            else:
+                blk.append(d2l.Residual(out_channels, out_channels))
+        return nn.Sequential(*blk)
+
+    # 该模型使用了更小的卷积核、步长和填充，而且删除了最大汇聚层
+    net = nn.Sequential(
+        nn.Conv2d(in_channels, 64, kernel_size=3, stride=1, padding=1),
+        nn.BatchNorm2d(64),
+        nn.ReLU()
+    )
+    net.add_module("resnet_block1", resnet_block(64, 64, 2, first_block=True))
+    net.add_module("resnet_block2", resnet_block(64, 128, 2))
+    net.add_module("resnet_block3", resnet_block(128, 256, 2))
+    net.add_module("resnet_block4", resnet_block(256, 512, 2))
+    net.add_module("global_avg_pool", nn.AdaptiveAvgPool2d((1,1)))
+    net.add_module("fc", nn.Sequential(nn.Flatten(), nn.Linear(512, num_classes)))
+    return net
