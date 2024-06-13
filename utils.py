@@ -333,6 +333,7 @@ def train_gpus(net, train_iter, test_iter, loss, trainer, num_epochs,
     
     num_batches = len(train_iter)
     net = nn.DataParallel(net, device_ids=devices).to(devices[0])
+    print(f'training on: {devices}, [{time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())}]')
     for epoch in range(num_epochs):
         # 4个维度：训练损失之和，训练准确数之和，样本数，标签特点数
         train_loss = 0
@@ -367,7 +368,7 @@ def train_gpus(net, train_iter, test_iter, loss, trainer, num_epochs,
             train_acc = train_hat_true_count / train_num_count
             
         all_train_num_count += train_num_count
-        test_acc = evaluate_accuracy_gpu(net, test_iter)
+        test_acc = evaluate_accuracy_gpu(net, test_iter) if test_iter is not None else 0
         
         print(f'epoch: {epoch+1}/{num_epochs}, loss {train_l:.3f}, '
               f'train acc {train_acc:.3f}, test acc {test_acc:.3f}')
