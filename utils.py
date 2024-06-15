@@ -323,7 +323,7 @@ def train_gpus(net, train_iter, test_iter, loss, trainer, num_epochs,
     """用多GPU进行模型训练"""
     time_0 = time.time()
     # 时间用时列表
-    time_list = list()
+    train_time_list = list()
     # 总训练过的数据数量
     all_train_num_count = 0
     # 初始化参数：训练集损失，训练集准确率，测试集准确率
@@ -335,6 +335,7 @@ def train_gpus(net, train_iter, test_iter, loss, trainer, num_epochs,
     net = nn.DataParallel(net, device_ids=devices).to(devices[0])
     print(f'training on: {devices}, [{time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())}]')
     for epoch in range(num_epochs):
+        epoch_time_0 = time.time()
         # 4个维度：训练损失之和，训练准确数之和，样本数，标签特点数
         train_loss = 0
         train_hat_true_count = 0
@@ -343,8 +344,6 @@ def train_gpus(net, train_iter, test_iter, loss, trainer, num_epochs,
         # 训练模式
         net.train()
         for i, (X, y) in enumerate(train_iter):
-            start_time = time.time()
-            
             if isinstance(X, list):
                 # 微调BERT中所需
                 X = [x.to(devices[0]) for x in X]
@@ -357,25 +356,27 @@ def train_gpus(net, train_iter, test_iter, loss, trainer, num_epochs,
             l = loss(y_hat, y)
             l.sum().backward()
             trainer.step()
+            
             with torch.no_grad():
                 train_loss += l.sum()
                 train_hat_true_count += accuracy(y_hat, y)
                 train_num_count += X.shape[0]
             
-            time_list.append(time.time() - start_time)
-            
             train_l = train_loss / train_num_count
             train_acc = train_hat_true_count / train_num_count
             
+        train_time_list.append(time.time() - epoch_time_0)    # 训练阶段耗时记录
+        
         all_train_num_count += train_num_count
         test_acc = evaluate_accuracy_gpu(net, test_iter) if test_iter is not None else 0
         
-        print(f'epoch: {epoch+1}/{num_epochs}, loss {train_l:.3f}, '
-              f'train acc {train_acc:.3f}, test acc {test_acc:.3f}')
+        epoch_time = time.time() - epoch_time_0    # 当前epoch耗时
+        print(f'epoch: {epoch+1}/{num_epochs}, loss: {train_l:.3f}, '
+              f'train_acc: {train_acc:.3f}, test_acc: {test_acc:.3f}, '
+              f'epoch_time: [{time_s2dhms(epoch_time)}]')
         
-    print(f'*** {all_train_num_count / sum(time_list):.1f} examples/sec '
-          f'on {str(devices)} - [{time_s2dhms(sum(time_list))}], '
-          f'all: [{time_s2dhms(time.time() - time_0)}] ***')
+    print(f'*** training speed: {all_train_num_count / sum(train_time_list):.1f} examples/sec '
+          f'on {str(devices)}, all_time: [{time_s2dhms(time.time() - time_0)}] ***')
 
 
     
