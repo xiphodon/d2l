@@ -10,6 +10,9 @@ from IPython import display
 import time
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
+from pathlib import Path
+import pandas as pd
+from torchvision.io import image
 
 
 class Animator:
@@ -759,7 +762,7 @@ def multibox_detection(cls_probs, offset_preds, anchors, nms_threshold=0.5, pos_
         # cls_prob的shape为(num_cls, num_anchors), offset_pred的shape为(num_anchors, 4)
         cls_prob, offset_pred = cls_probs[i], offset_preds[i].reshape(-1, 4)
         # 每个锚框的最大正类置信度和类别索引（索引从第一个正类开始，不包含负类背景0）
-        conf, class_id = torch.max(cls_prob[1:], dim=0)    # conf和class_id的shape都为(num_anchors,)
+        conf, class_id = torch.max(cls_prob[1:], dim=0)    # conf和class_id的shape都为(num_anchors,)，返回max的value和index
         predicted_bb = offset_inverse(anchors, offset_pred)    # 根据锚框和偏移量转换为预测边界框（新锚框）
         keep = nms(predicted_bb, conf, nms_threshold)    # 非极大值抑制后，保留下来的边界框索引，是锚框/新锚框的索引向量
 
@@ -776,10 +779,47 @@ def multibox_detection(cls_probs, offset_preds, anchors, nms_threshold=0.5, pos_
         below_pos_threshold_idx = (conf < pos_threshold)
         class_id[below_pos_threshold_idx] = -1    # 将pos_threshold置信度不到阈值的预测都认定为背景类别
         conf[below_pos_threshold_idx] = 1 - conf[below_pos_threshold_idx]    # 将低于阈值的正类置信度都重置为负类背景的置信度（1-conf）
-        # 拼接 类别、置信度、新锚框 ，pred_info的shape为(num_class_id, 1+1+4)
+        # 拼接 类别、置信度、新锚框 ，pred_info的shape为(num_anchors, 1+1+4)
         pred_info = torch.cat((class_id.unsqueeze(1), conf.unsqueeze(1), predicted_bb), dim=1)
         out.append(pred_info)
     # 多批数据合并
     return torch.stack(out)
 
 
+def read_data_bananas(is_train=True):
+    """读取香蕉检测数据集中的图像和标签"""
+    data_dir_name = 'banana-detection'
+    data_path = Path(rf'../data/{data_dir_name}')
+    
+    train_or_valid_dir = data_path / 'bananas_train' if is_train else data_path / 'bananas_val'
+    csv_fname = train_or_valid_dir / 'label.csv'
+    csv_data = pd.read_csv(csv_fname.as_posix())
+    csv_data = csv_data.set_index('img_name')
+    images, targets = [], []
+    for img_name, target in csv_data.iterrows():
+        _img = image.read_image((train_or_valid_dir / 'images' / img_name).as_posix())
+        images.append(_img)
+        # 这里的target包含（类别，左上角x，左上角y，右下角x，右下角y），
+        # 其中所有图像都具有相同的香蕉类（索引为0）
+        targets.append(list(target))
+    return images, torch.tensor(targets).unsqueeze(1) / 256    # 将坐标缩放到[0, 1]，类别为0，无影响
+
+
+class BananasDataset(torch.utils.data.Dataset):
+    """一个用于加载香蕉检测数据集的自定义数据集"""
+    def __init__(self, is_train):
+        self.features, self.labels = read_data_bananas(is_train)
+        print(f'read {str(len(self.features))} {"training" if is_train else "validation"} examples')
+
+    def __getitem__(self, idx):
+        return (self.features[idx].float(), self.labels[idx])
+
+    def __len__(self):
+        return len(self.features)
+    
+    
+def load_data_bananas(batch_size):
+    """加载香蕉检测数据集"""
+    train_iter = torch.utils.data.DataLoader(BananasDataset(is_train=True), batch_size, shuffle=True)
+    valid_iter = torch.utils.data.DataLoader(BananasDataset(is_train=False), batch_size)
+    return train_iter, valid_iter
