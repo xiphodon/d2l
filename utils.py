@@ -362,11 +362,12 @@ def train_gpus(net, train_iter, test_iter, loss, trainer, num_epochs,
             
             with torch.no_grad():
                 train_loss += l.sum()
-                train_hat_true_count += accuracy(y_hat, y)
                 train_num_count += X.shape[0]
+                train_hat_true_count += accuracy(y_hat, y)
+                labels_num_element_count += y.numel()
             
-            train_l = train_loss / train_num_count
-            train_acc = train_hat_true_count / train_num_count
+        train_l = train_loss / train_num_count
+        train_acc = train_hat_true_count / labels_num_element_count
             
         train_time_list.append(time.time() - epoch_time_0)    # 训练阶段耗时记录
         
@@ -823,3 +824,112 @@ def load_data_bananas(batch_size):
     train_iter = torch.utils.data.DataLoader(BananasDataset(is_train=True), batch_size, shuffle=True)
     valid_iter = torch.utils.data.DataLoader(BananasDataset(is_train=False), batch_size)
     return train_iter, valid_iter
+
+
+def read_voc_images(voc_dir, is_train=True):
+    """读取所有VOC图像并标注"""
+    txt_dir = voc_dir / 'ImageSets' / 'Segmentation'
+    txt_fpath = txt_dir / 'train.txt' if is_train else txt_dir / 'val.txt'
+    mode = torchvision.io.image.ImageReadMode.RGB
+    with open(txt_fpath.as_posix(), 'r') as f:
+        image_name_list = f.read().split()
+    features, labels = [], []
+    for i, fname in enumerate(image_name_list):
+        features.append(torchvision.io.read_image((voc_dir / 'JPEGImages' / f'{fname}.jpg').as_posix()))
+        labels.append(torchvision.io.read_image((voc_dir / 'SegmentationClass' / f'{fname}.png').as_posix(), mode))
+    return features, labels
+
+# 常量，RGB颜色值和类名
+VOC_COLORMAP = [[0, 0, 0], [128, 0, 0], [0, 128, 0], [128, 128, 0],
+                [0, 0, 128], [128, 0, 128], [0, 128, 128], [128, 128, 128],
+                [64, 0, 0], [192, 0, 0], [64, 128, 0], [192, 128, 0],
+                [64, 0, 128], [192, 0, 128], [64, 128, 128], [192, 128, 128],
+                [0, 64, 0], [128, 64, 0], [0, 192, 0], [128, 192, 0],
+                [0, 64, 128]]
+
+VOC_CLASSES = ['background', 'aeroplane', 'bicycle', 'bird', 'boat',
+               'bottle', 'bus', 'car', 'cat', 'chair', 'cow',
+               'diningtable', 'dog', 'horse', 'motorbike', 'person',
+               'potted plant', 'sheep', 'sofa', 'train', 'tv/monitor']
+
+def voc_colormap2label():
+    """
+        构建从RGB到VOC类别索引的映射
+        即：可以给定一个rgb颜色索引即可对应出类别
+    """
+    colormap2label = torch.zeros(256 ** 3, dtype=torch.long)    # rgb三通道空间大小为256 * 256 *256，将rgb以256进制计算为一个数字
+    for i, colormap in enumerate(VOC_COLORMAP):
+        colormap2label[(colormap[0] * 256 + colormap[1]) * 256 + colormap[2]] = i
+    return colormap2label
+
+def voc_label_indices(colormap, colormap2label):
+    """
+        将VOC标签中的RGB值映射到它们的类别索引
+    """
+    colormap = colormap.permute(1, 2, 0).numpy().astype('int32')
+    idx = (colormap[:, :, 0] * 256 + colormap[:, :, 1]) * 256 + colormap[:, :, 2]    # 通过不同权重叠加整合，三通道合并为一通道
+    return colormap2label[idx]
+
+def voc_rand_crop(feature, label, height, width):
+    """随机裁剪特征和标签图像"""
+    rect = torchvision.transforms.RandomCrop.get_params(feature, (height, width))
+    feature = torchvision.transforms.functional.crop(feature, *rect)
+    label = torchvision.transforms.functional.crop(label, *rect)
+    return feature, label
+
+
+class VOCSegDataset(torch.utils.data.Dataset):
+    """
+        一个用于加载VOC数据集的自定义数据集
+    """
+    def __init__(self, is_train, crop_size, voc_dir):
+        self.transform = torchvision.transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        self.crop_size = crop_size
+        self.colormap2label = voc_colormap2label()
+        txt_dir = voc_dir / 'ImageSets' / 'Segmentation'
+        txt_fpath = txt_dir / 'train.txt' if is_train else txt_dir / 'val.txt'
+        self.mode = torchvision.io.image.ImageReadMode.RGB
+        with open(txt_fpath.as_posix(), 'r') as f:
+            image_name_list = f.read().split()
+        self._img_path_list = [voc_dir / 'JPEGImages' / f'{fname}.jpg' for fname in image_name_list]
+        self._label_path_list = [voc_dir / 'SegmentationClass' / f'{fname}.png' for fname in image_name_list]
+        
+        self.img_path_list = list()
+        self.label_path_list = list()
+        for img_path in self._img_path_list:
+            img = torchvision.io.read_image(img_path.as_posix())
+            if self.crop_check(img):
+                self.img_path_list.append(img_path)
+        for label_path in self._label_path_list:
+            label = torchvision.io.read_image(label_path.as_posix(), self.mode)
+            if self.crop_check(label):
+                self.label_path_list.append(label_path) 
+                
+        self._img_path_list = self._label_path_list = None
+        print('read ' + str(len(self.img_path_list)) + ' examples')
+
+    def normalize_image(self, img):
+        return self.transform(img.float() / 255)
+
+    def crop_check(self, img):
+        return img.shape[1] >= self.crop_size[0] and img.shape[2] >= self.crop_size[1]
+    
+    def filter(self, imgs):
+        return [img for img in imgs if (img.shape[1] >= self.crop_size[0] and img.shape[2] >= self.crop_size[1])]
+
+    def __getitem__(self, idx):
+        _img = self.normalize_image(torchvision.io.read_image(self.img_path_list[idx].as_posix()))
+        _label = torchvision.io.read_image(self.label_path_list[idx].as_posix(), self.mode)
+        img, label = voc_rand_crop(_img, _label, *self.crop_size)
+        return (img, voc_label_indices(label, self.colormap2label))
+
+    def __len__(self):
+        return len(self.img_path_list)
+    
+    
+def load_data_voc(batch_size, crop_size, voc_dir):
+    """加载VOC语义分割数据集"""
+    num_workers = get_dataloader_workers()
+    train_iter = torch.utils.data.DataLoader(VOCSegDataset(True, crop_size, voc_dir), batch_size, shuffle=True, drop_last=True, num_workers=num_workers)
+    test_iter = torch.utils.data.DataLoader(VOCSegDataset(False, crop_size, voc_dir), batch_size, drop_last=True, num_workers=num_workers)
+    return train_iter, test_iter
